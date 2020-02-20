@@ -151,6 +151,7 @@ class BuildInfoAnalyzer(threading.Thread):
 
 
     def __retry_failed_downstream_jobs(self):
+        return self.downstream_result["tasks"]
         retry_per_failed_task = {}
         for task, info in self.downstream_result["tasks"].items():
             if info["state"] == "failed":
@@ -172,8 +173,9 @@ class BuildInfoAnalyzer(threading.Thread):
                 self.__log("WARNING", f"    {task}")
 
         failing_tasks = [task for task, info in retry_per_failed_task.items() if info["state"] == "failed"]
-        bisect_build = self.__trigger_bisect(failing_tasks)
-        bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(bisect_build["number"])
+        # bisect_build = self.__trigger_bisect(failing_tasks)
+        # bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(bisect_build["number"])
+        bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(270)
         bisect_result_by_task = {}
         for task in failing_tasks:
             for job in bisect_build["jobs"]:
