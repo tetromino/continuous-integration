@@ -202,7 +202,7 @@ class BuildInfoAnalyzer(threading.Thread):
 
         # Report failed tasks
         self.__log("WARNING", "The following tasks are failing in main pipeline")
-        self.__print_job_list([info for _, info in self.main_result["tasks"].items() if info["state"] == "failed"])
+        self.__print_job_list([info for _, info in self.main_result["tasks"].items() if info["state"] != "passed"])
 
         # Retry all failed tasks
         self.__log("PASSED", "Retry failed main pipeline tasks...")
@@ -230,7 +230,7 @@ class BuildInfoAnalyzer(threading.Thread):
 
         # Report failed tasks
         self.__log("WARNING", "The following tasks are failing in downstream pipeline")
-        self.__print_job_list([info for _, info in self.downstream_result["tasks"].items() if info["state"] == "failed"])
+        self.__print_job_list([info for _, info in self.downstream_result["tasks"].items() if info["state"] != "passed"])
 
         # Retry all failed tasks
         self.__log("PASSED", "Retry failed downstream pipeline tasks...")
