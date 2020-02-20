@@ -25,6 +25,7 @@ import os
 import os.path
 import random
 import re
+import requests
 from shutil import copyfile
 import shutil
 import stat
@@ -565,38 +566,136 @@ P9w8kNhEbw==
         "https://api.buildkite.com/v2/organizations/{}/pipelines/{}/builds/{}"
     )
 
-    def __init__(self, org, pipeline):
+    _NEW_BUILD_URL_TEMPLATE = (
+        "https://api.buildkite.com/v2/organizations/{}/pipelines/{}/builds"
+    )
+
+    _RETRY_JOB_URL_TEMPLATE = (
+        "https://api.buildkite.com/v2/organizations/{}/pipelines/{}/builds/{}/jobs/{}/retry"
+    )
+
+    def __init__(self, org, pipeline, token=None):
         self._org = org
         self._pipeline = pipeline
-        self._token = self._get_buildkite_token()
+        if token:
+            self._token = token
+        else:
+            self._token = BuildkiteClient.get_buildkite_token()
 
-    def _get_buildkite_token(self):
+
+    @staticmethod
+    def get_buildkite_token():
         return decrypt_token(
-            encrypted_token=self._ENCRYPTED_BUILDKITE_API_TESTING_TOKEN
+            encrypted_token=BuildkiteClient._ENCRYPTED_BUILDKITE_API_TESTING_TOKEN
             if THIS_IS_TESTING
-            else self._ENCRYPTED_BUILDKITE_API_TOKEN,
+            else BuildkiteClient._ENCRYPTED_BUILDKITE_API_TOKEN,
             kms_key="buildkite-testing-api-token"
             if THIS_IS_TESTING
             else "buildkite-untrusted-api-token",
         )
 
-    def _open_url(self, url):
+
+    def _open_url(self, url, params = None):
         try:
+            params_str = ""
+            if params:
+                for k, v in params:
+                    params_str = params_str + "&{}={}".format(k, v)
             return (
-                urllib.request.urlopen("{}?access_token={}".format(url, self._token))
+                urllib.request.urlopen("{}?access_token={}{}".format(url, self._token, params_str))
                 .read()
                 .decode("utf-8")
             )
         except urllib.error.HTTPError as ex:
             raise BuildkiteException("Failed to open {}: {} - {}".format(url, ex.code, ex.reason))
 
+
+    # Get build info for a pipeline with a given build number
+    # See https://buildkite.com/docs/apis/rest-api/builds#get-a-build
     def get_build_info(self, build_number):
         url = self._BUILD_STATUS_URL_TEMPLATE.format(self._org, self._pipeline, build_number)
         output = self._open_url(url)
         return json.loads(output)
 
+
+    # Get a list of build infos for a pipeline
+    # Some parameters can be set to filter the result.
+    # See https://buildkite.com/docs/apis/rest-api/builds#list-builds-for-a-pipeline
+    def get_build_info_list(self, params):
+        url = self._BUILD_STATUS_URL_TEMPLATE.format(self._org, self._pipeline, "")
+        output = self._open_url(url, params)
+        return json.loads(output)
+
+
     def get_build_log(self, job):
         return self._open_url(job["raw_log_url"])
+
+
+    @staticmethod
+    def __check_response(response, expected_status_code):
+        if response.status_code != expected_status_code:
+            print("Exit code:", response.status_code)
+            print("Response:\n", response.text)
+            response.raise_for_status()
+
+
+    # Trigger a new build at a given commit and return the build metadata.
+    def trigger_new_build(self, commit, message = None, env = {}):
+        url = self._NEW_BUILD_URL_TEMPLATE.format(self._org, self._pipeline)
+        data = {
+            "commit": commit,
+            "branch": "master",
+            "message": message if message else f"Trigger build at {commit}",
+            "env": env,
+        }
+        response = requests.post(url + "?access_token=" + self._token, json = data)
+        BuildkiteClient.__check_response(response, requests.codes.created)
+        return json.loads(response.text)
+
+
+    # Trigger a job retry and return the job metadata.
+    def trigger_job_retry(self, build_number, job_id):
+        url = self._RETRY_JOB_URL_TEMPLATE.format(self._org, self._pipeline, build_number, job_id)
+        response = requests.put(url + "?access_token=" + self._token)
+        BuildkiteClient.__check_response(response, requests.codes.ok)
+        return json.loads(response.text)
+
+
+    # Wait a job to finish and return the job metadata
+    def wait_job_to_finish(self, build_number, job_id):
+        WAIT_TIME = 60
+        t = 0
+        build_info = self.get_build_info(build_number)
+        while True:
+            for job in build_info["jobs"]:
+                if job["id"] == job_id:
+                    state = job["state"]
+                    if state != "scheduled" and state != "running" and state != "assigned":
+                        return job
+                    break
+            else:
+                raise BuildkiteException(f"job id {job_id} doesn't exist in build " + build_info["web_url"])
+            title = build_info["message"]
+            url = build_info["web_url"]
+            print(f"Waiting another {WAIT_TIME} seconds for '{url}', waited {t} seconds...")
+            time.sleep(WAIT_TIME)
+            t = t + WAIT_TIME
+            build_info = self.get_build_info(build_number)
+
+
+    # Wait a build to finish and return the build metadata
+    def wait_build_to_finish(self, build_number):
+        WAIT_TIME = 60
+        t = 0
+        build_info = self.get_build_info(build_number)
+        while build_info["state"] == "scheduled" or build_info["state"] == "running":
+            title = build_info["message"]
+            url = build_info["web_url"]
+            print(f"Waiting another {WAIT_TIME} seconds for '{url}', waited {t} seconds...")
+            time.sleep(WAIT_TIME)
+            t = t + WAIT_TIME
+            build_info = self.get_build_info(build_number)
+        return build_info
 
 
 def decrypt_token(encrypted_token, kms_key):
