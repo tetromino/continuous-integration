@@ -78,7 +78,7 @@ class BuildInfoAnalyzer(threading.Thread):
             "downstream_fail_reason": None,
             "bisect_result": None,
         }
-        self.analyze_log = []
+        self.analyze_log = [COLORS["HEADER"] + f"Analyzing {self.project}: " + COLORS["ENDC"]]
 
 
     def __get_main_build_result(self):
@@ -90,7 +90,9 @@ class BuildInfoAnalyzer(threading.Thread):
             ("state[]", "passed"),
         ])
         if len(build_info_list) == 0:
-            raise bazelci.BuildkiteException("Cannot find finished build in the past day for pipeline %s, please try to rerun the pipeline first." % self.pipeline)
+            error = "Cannot find finished build in the past day for pipeline %s, please try to rerun the pipeline first." % self.pipeline
+            self.__log("SERIOUS", error)
+            raise bazelci.BuildkiteException(error)
         main_build_info = build_info_list[0]
 
         self.main_result = {}
@@ -122,7 +124,7 @@ class BuildInfoAnalyzer(threading.Thread):
 
 
     def __log(self, c, text):
-        self.analyze_log.append(COLORS["HEADER"] + f"Analyzing {self.project}: " + COLORS["ENDC"] + COLORS[c] + text + COLORS["ENDC"])
+        self.analyze_log.append(COLORS[c] + text + COLORS["ENDC"])
         info = [
             f"<details><summary><strong>:bk-status-failed: {self.project}</strong></summary><p>",
             "",
@@ -152,14 +154,14 @@ class BuildInfoAnalyzer(threading.Thread):
         pos = bisect_log.rfind("first bad commit is")
         if pos != -1:
             return "\n".join([
-                 "Culprit found:",
-                 bisect_log[pos:],
+                 "Culprit found!",
+                 bisect_log[pos:].replace("\r", ""),
                  "Bisect URL: " + job["web_url"],
             ])
         pos = bisect_log.rfind("Given good commit")  # Matching "Given good commit (XXXX) is not actually good, abort bisecting."
         if pos != -1:
             return "\n".join([
-                "Given good commit is now failing. This is probably caused remote cache issue or infra change.",
+                "Given good commit is now failing. This is probably caused by remote cache issue or infra change.",
                 "Please ping philwo@ or pcloudy@ for investigation.",
                 "Bisect URL: " + job["web_url"],
             ])
@@ -174,52 +176,97 @@ class BuildInfoAnalyzer(threading.Thread):
         return "Bisect failed due to unknown reason, please check " + job["web_url"]
 
 
-    def __analyze_result_for_main_pipeline(self):
-        self.__log("INFO", "Start analyzing failures in main pipeline...")
-        self.analyze_result["result"] = "failed"
-        failing_tasks_str = ", ".join([task for task, info in self.main_result["tasks"].items() if info["state"] == "failed"])
-        last_green_commit = self.main_result["last_green_commit"]
-        self.analyze_result["main_fail_reason"] = f"The project is probably broken due to its own change, last_green_commit is {last_green_commit}. Failing tasks are {failing_tasks_str}"
-
-
-    def __retry_failed_downstream_jobs(self):
-        # return self.downstream_result["tasks"]
+    def __retry_failed_jobs(self, build_result, buildkite_client):
         retry_per_failed_task = {}
-        for task, info in self.downstream_result["tasks"].items():
+        for task, info in build_result["tasks"].items():
             if info["state"] != "passed":
-                retry_per_failed_task[task] = DOWNSTREAM_PIPELINE_CLIENT.trigger_job_retry(self.downstream_result["build_number"], info["id"])
+                retry_per_failed_task[task] = buildkite_client.trigger_job_retry(build_result["build_number"], info["id"])
         for task, job_info in retry_per_failed_task.items():
-            retry_per_failed_task[task] = DOWNSTREAM_PIPELINE_CLIENT.wait_job_to_finish(self.downstream_result["build_number"], job_info["id"], self)
+            retry_per_failed_task[task] = buildkite_client.wait_job_to_finish(build_number = build_result["build_number"], job_id = job_info["id"], logger = self)
         return retry_per_failed_task
 
 
-    def __analyze_result_for_downstream_pipeline(self):
-        self.__log("INFO", "Start analyzing failures in downstream pipeline...")
+    def __print_job_list(self, jobs):
+        for job in jobs:
+            name = job["name"]
+            url = job["web_url"]
+            self.__log("INFO", f"  {name}: {url}")
+        self.__log("INFO", "")
 
-        self.analyze_result["result"] = "failed"
-        self.__log("INFO", "Retrying failed downstream tasks...")
-        retry_per_failed_task = self.__retry_failed_downstream_jobs()
 
-        # Report succeeded tasks as flaky
-        flaky_tasks = [task for task, info in retry_per_failed_task.items() if info["state"] == "passed"]
-        if flaky_tasks:
-            self.__log("WARNING", "The following tasks passed after retry:")
-            for task in flaky_tasks:
-                self.__log("WARNING", f"    {task}")
+    def __analyze_main_pipeline_result(self):
+        self.__log("INFO", "")
+        self.__log("PASSED", "Start analyzing failures in main pipeline...")
 
-        failing_tasks = [task for task, info in retry_per_failed_task.items() if info["state"] == "failed"]
-        self.__log("INFO", f"Initial a bisect for {self.project}...")
-        # bisect_build = self.__trigger_bisect(failing_tasks)
-        # bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(bisect_build["number"], self)
-        bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(270, self)
+        # Report failed tasks
+        self.__log("WARNING", "The following tasks are failing in main pipeline")
+        self.__print_job_list([info for _, info in self.main_result["tasks"].items() if info["state"] == "failed"])
+
+        # Retry all failed tasks
+        self.__log("PASSED", "Retry failed main pipeline tasks...")
+        retry_per_failed_task = self.__retry_failed_jobs(self.main_result, self.client)
+        self.__log("PASSED", "")
+
+        # Report tasks that succeeded after retry
+        succeeded_tasks = [info for _, info in retry_per_failed_task.items() if info["state"] == "passed"]
+        if succeeded_tasks:
+            self.__log("PASSED", "The following tasks succeeded after retry, they might be flaky")
+            self.__print_job_list(succeeded_tasks)
+
+        # Report tasks that are still failing after retry
+        still_failing_tasks = [info for _, info in retry_per_failed_task.items() if info["state"] != "passed"]
+        if still_failing_tasks:
+            last_green_commit = self.main_result["last_green_commit"]
+            self.__log("FAIL", f"The following tasks are still failing after retry, they are probably broken due to changes from the project itself.")
+            self.__log("FAIL", f"The last green commit is {last_green_commit}. Please file bug for the repository.")
+            self.__print_job_list(still_failing_tasks)
+
+
+    def __analyze_for_downstream_pipeline_result(self):
+        self.__log("INFO", "")
+        self.__log("PASSED", "Start analyzing failures in downstream pipeline...")
+
+        # Report failed tasks
+        self.__log("WARNING", "The following tasks are failing in downstream pipeline")
+        self.__print_job_list([info for _, info in self.downstream_result["tasks"].items() if info["state"] == "failed"])
+
+        # Retry all failed tasks
+        self.__log("PASSED", "Retry failed downstream pipeline tasks...")
+        retry_per_failed_task = self.__retry_failed_jobs(self.downstream_result, DOWNSTREAM_PIPELINE_CLIENT)
+        self.__log("PASSED", "")
+
+        # Report tasks that succeeded after retry
+        succeeded_tasks = [info for _, info in retry_per_failed_task.items() if info["state"] == "passed"]
+        if succeeded_tasks:
+            self.__log("PASSED", "The following tasks succeeded after retry, they might be flaky")
+            self.__print_job_list(succeeded_tasks)
+
+        # Report tasks that are still failing after retry
+        still_failing_tasks = [info for _, info in retry_per_failed_task.items() if info["state"] != "passed"]
+        if still_failing_tasks:
+            self.__log("FAIL", f"The following tasks are still failing after retry, they are probably broken due to recent Bazel changes.")
+            self.__print_job_list(still_failing_tasks)
+
+        # Do bisect for still failing jobs
+        self.__log("PASSED", f"Bisect for still failing tasks...")
+        failing_task_names = [name for name, info in retry_per_failed_task.items() if info["state"] != "passed"]
+        bisect_build = self.__trigger_bisect(failing_task_names)
+        bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(build_number = bisect_build["number"], logger = self)
+        # bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(build_number = 270, logger = self)
         bisect_result_by_task = {}
-        for task in failing_tasks:
+        for task in failing_task_names:
             for job in bisect_build["jobs"]:
                 if ("--task_name=" + task) in job["command"]:
                     bisect_result_by_task[task] = self.__determine_bisect_result(job)
             if task not in bisect_result_by_task:
-                raise bazelci.BuildkiteException(f"Bisect job for task {task} is missing in " + job["web_url"])
-        self.analyze_result["bisect_result"] = bisect_result_by_task
+                error = f"Bisect job for task {task} is missing in " + bisect_build["web_url"]
+                self.__log("SERIOUS", error)
+                raise bazelci.BuildkiteException(error)
+
+        # Report bisect result
+        for task, result in bisect_result_by_task.items():
+            self.__log("WARNING", "Bisect result for " + self.downstream_result["tasks"][task]["name"])
+            self.__log("INFO", result)
 
 
     def analyze(self):
@@ -230,31 +277,34 @@ class BuildInfoAnalyzer(threading.Thread):
 
         # Main build: FAILED; Downstream build: PASSED
         if self.main_result["state"] == "failed" and self.downstream_result["state"] == "passed":
-            self.__log("WARNING", "Project passed in downstream build, but failed in main build. The build seems to be broken by changes from the project itself.")
-            self.__analyze_result_for_main_pipeline()
+            self.__log("WARNING", "Project passed in downstream build, but failed in main build.")
+            self.__analyze_main_pipeline_result()
             return
 
         # Main build: PASSED; Downstream build: FAILED
         if self.main_result["state"] == "passed" and self.downstream_result["state"] == "failed":
-            self.__log("FAIL", "Project passed in main build, but failed in downstream build. It's likely a Bazel bug.")
-            self.__analyze_result_for_downstream_pipeline()
+            self.__log("FAIL", "Project passed in main build, but failed in downstream build.")
+            self.__analyze_for_downstream_pipeline_result()
             return
 
         # Main build: FAILED; Downstream build: FAILED
         if self.main_result["state"] == "failed" and self.downstream_result["state"] == "failed":
-            self.__log("SERIOUS", f"Project failed in both main build and downstream build. This might be caused by an infra change.")
+            self.__log("SERIOUS", f"Project failed in both main build and downstream build.")
 
+            # Rebuild the project at last green commit, check if the failure is caused by infra change.
             last_green_commit = self.main_result["last_green_commit"]
-            self.__log("INFO", f"Initial a new build at last green commit {last_green_commit}...")
+            self.__log("INFO", f"Rebuild at last green commit {last_green_commit}...")
             build_info = self.client.trigger_new_build(last_green_commit)
-            build_info = self.client.wait_build_to_finish(build_info["number"], self)
+            build_info = self.client.wait_build_to_finish(build_number = build_info["number"], logger = self)
 
             if build_info["state"] == "failed":
                 self.__log("SERIOUS", f"Project failed at last green commit. This is probably caused by an infra change, please ping philwo@ or pcloudy@.")
+            elif build_info["state"] == "passed":
+                self.__log("PASSED", f"Project succeeded at last green commit. Maybe main pipeline and downstream pipeline are broken for different reasons.")
+                self.__analyze_main_pipeline_result()
+                self.__analyze_for_downstream_pipeline_result()
             else:
-                self.__log("PASSED", f"Project succeeded at last green commit.")
-                self.__analyze_result_for_main_pipeline()
-                self.__analyze_result_for_downstream_pipeline()
+                self.__log("SERIOUS", f"Rebuilding project at last green commit failed with unknown reason. Please check " + build_info["web_url"])
             return
 
 

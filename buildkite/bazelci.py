@@ -662,8 +662,7 @@ P9w8kNhEbw==
 
 
     # Wait a job to finish and return the job metadata
-    def wait_job_to_finish(self, build_number, job_id, logger):
-        WAIT_TIME = 60
+    def wait_job_to_finish(self, build_number, job_id, wait_time=30, logger=None):
         t = 0
         build_info = self.get_build_info(build_number)
         while True:
@@ -677,23 +676,24 @@ P9w8kNhEbw==
                 raise BuildkiteException(f"job id {job_id} doesn't exist in build " + build_info["web_url"])
             title = build_info["message"]
             url = build_info["web_url"]
-            logger.log(f"Waiting another {WAIT_TIME} seconds for '{url}', waited {t} seconds...")
-            time.sleep(WAIT_TIME)
-            t = t + WAIT_TIME
+            if logger:
+                logger.log(f"Waiting for {url}, waited {t} seconds...")
+            time.sleep(wait_time)
+            t = t + wait_time
             build_info = self.get_build_info(build_number)
 
 
     # Wait a build to finish and return the build metadata
-    def wait_build_to_finish(self, build_number, logger):
-        WAIT_TIME = 60
+    def wait_build_to_finish(self, build_number, wait_time=30, logger=None):
         t = 0
         build_info = self.get_build_info(build_number)
         while build_info["state"] == "scheduled" or build_info["state"] == "running":
             title = build_info["message"]
             url = build_info["web_url"]
-            logger.log(f"Waiting another {WAIT_TIME} seconds for '{url}', waited {t} seconds...")
-            time.sleep(WAIT_TIME)
-            t = t + WAIT_TIME
+            if logger:
+                logger.log(f"Waiting for {url}, waited {t} seconds...")
+            time.sleep(wait_time)
+            t = t + wait_time
             build_info = self.get_build_info(build_number)
         return build_info
 
