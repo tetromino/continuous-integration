@@ -662,7 +662,7 @@ P9w8kNhEbw==
 
 
     # Wait a job to finish and return the job metadata
-    def wait_job_to_finish(self, build_number, job_id):
+    def wait_job_to_finish(self, build_number, job_id, logger):
         WAIT_TIME = 60
         t = 0
         build_info = self.get_build_info(build_number)
@@ -677,21 +677,21 @@ P9w8kNhEbw==
                 raise BuildkiteException(f"job id {job_id} doesn't exist in build " + build_info["web_url"])
             title = build_info["message"]
             url = build_info["web_url"]
-            print(f"Waiting another {WAIT_TIME} seconds for '{url}', waited {t} seconds...")
+            logger.log(f"Waiting another {WAIT_TIME} seconds for '{url}', waited {t} seconds...")
             time.sleep(WAIT_TIME)
             t = t + WAIT_TIME
             build_info = self.get_build_info(build_number)
 
 
     # Wait a build to finish and return the build metadata
-    def wait_build_to_finish(self, build_number):
+    def wait_build_to_finish(self, build_number, logger):
         WAIT_TIME = 60
         t = 0
         build_info = self.get_build_info(build_number)
         while build_info["state"] == "scheduled" or build_info["state"] == "running":
             title = build_info["message"]
             url = build_info["web_url"]
-            print(f"Waiting another {WAIT_TIME} seconds for '{url}', waited {t} seconds...")
+            logger.log(f"Waiting another {WAIT_TIME} seconds for '{url}', waited {t} seconds...")
             time.sleep(WAIT_TIME)
             t = t + WAIT_TIME
             build_info = self.get_build_info(build_number)
@@ -1818,8 +1818,9 @@ def execute_command_and_get_output(args, shell=False, fail_if_nonzero=True, prin
     return process.stdout
 
 
-def execute_command(args, shell=False, fail_if_nonzero=True, cwd=None):
-    eprint(" ".join(args))
+def execute_command(args, shell=False, fail_if_nonzero=True, cwd=None, print_output=True):
+    if print_output:
+        eprint(" ".join(args))
     return subprocess.run(
         args, shell=shell, check=fail_if_nonzero, env=os.environ, cwd=cwd
     ).returncode

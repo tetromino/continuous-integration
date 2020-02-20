@@ -29,11 +29,12 @@ CACHE = False
 
 COLORS = {
     "SERIOUS" : '\033[95m',
-    "INFO" : '\033[94m',
+    "HEADER" : '\033[34m',
     "PASSED" : '\033[92m',
     "WARNING" : '\033[93m',
     "FAIL" : '\033[91m',
     "ENDC" : '\033[0m',
+    "INFO" : '\033[0m',
     "BOLD" : '\033[1m',
 }
 
@@ -47,17 +48,21 @@ CULPRIT_FINDER_PIPELINE_CLIENT = get_new_buildkite_client(CULPRIT_FINDER_PIPELIN
 def print_info(context, style, info):
     info_str = "\n".join(info)
     bazelci.execute_command(
-        [
+        args = [
             "buildkite-agent",
             "annotate",
-            "--append",
+            # "--append",
             f"--context={context}",
             f"--style={style}",
             f"\n{info_str}\n",
-        ]
+        ],
+        print_output = False,
     )
 
 class BuildInfoAnalyzer(threading.Thread):
+
+    success_log_lock = threading.Lock()
+    success_log = []
 
     def __init__(self, project, pipeline, downstream_result):
         threading.Thread.__init__(self)
@@ -73,6 +78,7 @@ class BuildInfoAnalyzer(threading.Thread):
             "downstream_fail_reason": None,
             "bisect_result": None,
         }
+        self.analyze_log = []
 
 
     def __get_main_build_result(self):
@@ -100,13 +106,37 @@ class BuildInfoAnalyzer(threading.Thread):
         self.main_result["last_green_commit"] = bazelci.get_last_green_commit(last_green_commit_url)
 
 
+    def __log_success(self, text):
+        with BuildInfoAnalyzer.success_log_lock:
+            BuildInfoAnalyzer.success_log.append(COLORS["HEADER"] + f"Analyzing {self.project}: " + COLORS["ENDC"] + COLORS["PASSED"] + text + COLORS["ENDC"])
+            info = [
+                "<details><summary><strong>:bk-status-passed: Success</strong></summary><p>",
+                "",
+                "```term",
+            ] + BuildInfoAnalyzer.success_log + [
+                "```",
+                "",
+                "</p></details>"
+            ]
+            print_info("success-info", "success", info)
+
+
     def __log(self, c, text):
+        self.analyze_log.append(COLORS["HEADER"] + f"Analyzing {self.project}: " + COLORS["ENDC"] + COLORS[c] + text + COLORS["ENDC"])
         info = [
+            f"<details><summary><strong>:bk-status-failed: {self.project}</strong></summary><p>",
+            "",
             "```term",
-            COLORS["INFO"] + f"Analyzing {self.project}: " + COLORS["ENDC"] + COLORS[c] + text + COLORS["ENDC"],
+        ] + self.analyze_log + [
             "```",
+            "",
+            "</p></details>"
         ]
-        print_info(self.pipeline, "info", info)
+        print_info(self.pipeline, "warning", info)
+
+
+    def log(self, text):
+        self.__log("INFO", text)
 
 
     def __trigger_bisect(self, tasks):
@@ -145,23 +175,28 @@ class BuildInfoAnalyzer(threading.Thread):
 
 
     def __analyze_result_for_main_pipeline(self):
+        self.__log("INFO", "Start analyzing failures in main pipeline...")
+        self.analyze_result["result"] = "failed"
         failing_tasks_str = ", ".join([task for task, info in self.main_result["tasks"].items() if info["state"] == "failed"])
         last_green_commit = self.main_result["last_green_commit"]
         self.analyze_result["main_fail_reason"] = f"The project is probably broken due to its own change, last_green_commit is {last_green_commit}. Failing tasks are {failing_tasks_str}"
 
 
     def __retry_failed_downstream_jobs(self):
-        return self.downstream_result["tasks"]
+        # return self.downstream_result["tasks"]
         retry_per_failed_task = {}
         for task, info in self.downstream_result["tasks"].items():
-            if info["state"] == "failed":
+            if info["state"] != "passed":
                 retry_per_failed_task[task] = DOWNSTREAM_PIPELINE_CLIENT.trigger_job_retry(self.downstream_result["build_number"], info["id"])
         for task, job_info in retry_per_failed_task.items():
-            retry_per_failed_task[task] = DOWNSTREAM_PIPELINE_CLIENT.wait_job_to_finish(self.downstream_result["build_number"], job_info["id"])
+            retry_per_failed_task[task] = DOWNSTREAM_PIPELINE_CLIENT.wait_job_to_finish(self.downstream_result["build_number"], job_info["id"], self)
         return retry_per_failed_task
 
 
     def __analyze_result_for_downstream_pipeline(self):
+        self.__log("INFO", "Start analyzing failures in downstream pipeline...")
+
+        self.analyze_result["result"] = "failed"
         self.__log("INFO", "Retrying failed downstream tasks...")
         retry_per_failed_task = self.__retry_failed_downstream_jobs()
 
@@ -173,9 +208,10 @@ class BuildInfoAnalyzer(threading.Thread):
                 self.__log("WARNING", f"    {task}")
 
         failing_tasks = [task for task, info in retry_per_failed_task.items() if info["state"] == "failed"]
+        self.__log("INFO", f"Initial a bisect for {self.project}...")
         # bisect_build = self.__trigger_bisect(failing_tasks)
-        # bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(bisect_build["number"])
-        bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(270)
+        # bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(bisect_build["number"], self)
+        bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(270, self)
         bisect_result_by_task = {}
         for task in failing_tasks:
             for job in bisect_build["jobs"]:
@@ -189,31 +225,30 @@ class BuildInfoAnalyzer(threading.Thread):
     def analyze(self):
         # Main build: PASSED; Downstream build: PASSED
         if self.main_result["state"] == "passed" and self.downstream_result["state"] == "passed":
-            self.__log("PASSED", f"Project passed in both main build and downstream build.")
+            self.__log_success("Project passed in both main build and downstream build.")
             return
 
         # Main build: FAILED; Downstream build: PASSED
         if self.main_result["state"] == "failed" and self.downstream_result["state"] == "passed":
             self.__log("WARNING", "Project passed in downstream build, but failed in main build. The build seems to be broken by changes from the project itself.")
-            self.analyze_result["result"] = "failed"
             self.__analyze_result_for_main_pipeline()
             return
 
         # Main build: PASSED; Downstream build: FAILED
         if self.main_result["state"] == "passed" and self.downstream_result["state"] == "failed":
             self.__log("FAIL", "Project passed in main build, but failed in downstream build. It's likely a Bazel bug.")
-            self.__log("FAIL", f"Initial a bisect for {self.project}...")
-            self.analyze_result["result"] = "failed"
             self.__analyze_result_for_downstream_pipeline()
             return
 
         # Main build: FAILED; Downstream build: FAILED
         if self.main_result["state"] == "failed" and self.downstream_result["state"] == "failed":
             self.__log("SERIOUS", f"Project failed in both main build and downstream build. This might be caused by an infra change.")
+
             last_green_commit = self.main_result["last_green_commit"]
-            self.__log("SERIOUS", f"Initial a new build at last green commit {last_green_commit}...")
+            self.__log("INFO", f"Initial a new build at last green commit {last_green_commit}...")
             build_info = self.client.trigger_new_build(last_green_commit)
-            build_info = self.client.wait_build_to_finish(build_info["number"])
+            build_info = self.client.wait_build_to_finish(build_info["number"], self)
+
             if build_info["state"] == "failed":
                 self.__log("SERIOUS", f"Project failed at last green commit. This is probably caused by an infra change, please ping philwo@ or pcloudy@.")
             else:
