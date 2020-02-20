@@ -138,6 +138,8 @@ class BuildInfoAnalyzer(threading.Thread):
 
 
     def log(self, text):
+        if self.analyze_log[-1].startswith(COLORS["INFO"] + "Waiting for "):
+            self.analyze_log.pop(-1)
         self.__log("INFO", text)
 
 
