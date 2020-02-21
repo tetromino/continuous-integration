@@ -45,18 +45,18 @@ def get_new_buildkite_client(pipeline):
 DOWNSTREAM_PIPELINE_CLIENT = get_new_buildkite_client(DOWNSTREAM_PIPELINE)
 CULPRIT_FINDER_PIPELINE_CLIENT = get_new_buildkite_client(CULPRIT_FINDER_PIPELINE)
 
-def print_info(context, style, info):
+def print_info(context, style, info, append=True):
     info_str = "\n".join(info)
     bazelci.execute_command(
         args = [
             "buildkite-agent",
             "annotate",
-            # "--append",
+        ] + (["--append"] if append else []) + [
             f"--context={context}",
             f"--style={style}",
             f"\n{info_str}\n",
         ],
-        # print_output = False,
+        print_output = False,
     )
 
 class BuildInfoAnalyzer(threading.Thread):
@@ -71,14 +71,8 @@ class BuildInfoAnalyzer(threading.Thread):
         self.downstream_result = downstream_result
         self.main_result = None
         self.client = get_new_buildkite_client(pipeline)
-        # Set default analyze result
-        self.analyze_result = {
-            "result": "passed",
-            "main_fail_reason": None,
-            "downstream_fail_reason": None,
-            "bisect_result": None,
-        }
         self.analyze_log = [COLORS["HEADER"] + f"Analyzing {self.project}: " + COLORS["ENDC"]]
+        self.broken_by_infra = False
 
 
     def __get_main_build_result(self):
@@ -120,7 +114,7 @@ class BuildInfoAnalyzer(threading.Thread):
                 "",
                 "</p></details>"
             ]
-            print_info("success-info", "success", info)
+            print_info("success-info", "success", info, False)
 
 
     def __log(self, c, text):
@@ -134,7 +128,7 @@ class BuildInfoAnalyzer(threading.Thread):
             "",
             "</p></details>"
         ]
-        print_info(self.pipeline, "warning", info)
+        print_info(self.pipeline, "warning", info, False)
 
 
     def log(self, text):
@@ -153,20 +147,23 @@ class BuildInfoAnalyzer(threading.Thread):
 
     def __determine_bisect_result(self, job):
         bisect_log = CULPRIT_FINDER_PIPELINE_CLIENT.get_build_log(job)
-        pos = bisect_log.rfind("first bad commit is")
+        pos = bisect_log.rfind("first bad commit is ")
         if pos != -1:
+            start = pos + len("first bad commit is ")
+            culprit_commit = bisect_log[start:start + 40]
             return "\n".join([
                  "Culprit found!",
                  bisect_log[pos:].replace("\r", ""),
                  "Bisect URL: " + job["web_url"],
-            ])
+            ]), culprit_commit
         pos = bisect_log.rfind("Given good commit")  # Matching "Given good commit (XXXX) is not actually good, abort bisecting."
         if pos != -1:
+            self.broken_by_infra = True
             return "\n".join([
                 "Given good commit is now failing. This is probably caused by remote cache issue or infra change.",
                 "Please ping philwo@ or pcloudy@ for investigation.",
                 "Bisect URL: " + job["web_url"],
-            ])
+            ]), None
         pos = bisect_log.rfind("first bad commit not found, every commit succeeded.")
         if pos != -1:
             return "\n".join([
@@ -174,12 +171,12 @@ class BuildInfoAnalyzer(threading.Thread):
                 "Maybe the failed build are cached from previous build with a different Bazel version or it could be flaky.",
                 "Please try to rerun the bisect with NEEDS_CLEAN=1 and REPEAT_TIMES=3.",
                 "Bisect URL: " + job["web_url"],
-            ])
-        return "Bisect failed due to unknown reason, please check " + job["web_url"]
+            ]), None
+        return "Bisect failed due to unknown reason, please check " + job["web_url"], None
 
 
     def __retry_failed_jobs(self, build_result, buildkite_client):
-        return build_result["tasks"]
+        # return build_result["tasks"]
         retry_per_failed_task = {}
         for task, info in build_result["tasks"].items():
             if info["state"] != "passed":
@@ -210,17 +207,25 @@ class BuildInfoAnalyzer(threading.Thread):
         retry_per_failed_task = self.__retry_failed_jobs(self.main_result, self.client)
 
         # Report tasks that succeeded after retry
-        succeeded_tasks = [info for _, info in retry_per_failed_task.items() if info["state"] == "passed"]
+        succeeded_tasks = []
+        for task, info in retry_per_failed_task.items():
+            if info["state"] == "passed":
+                succeeded_tasks.append(info)
+                self.main_result["tasks"][task]["flaky"] = True
         if succeeded_tasks:
             self.__log("PASSED", "The following tasks succeeded after retry, they might be flaky")
             self.__print_job_list(succeeded_tasks)
 
         # Report tasks that are still failing after retry
-        still_failing_tasks = [info for _, info in retry_per_failed_task.items() if info["state"] != "passed"]
+        still_failing_tasks = []
+        for task, info in retry_per_failed_task.items():
+            if info["state"] != "passed":
+                still_failing_tasks.append(info)
+                self.main_result["tasks"][task]["broken"] = True
         if still_failing_tasks:
             last_green_commit = self.main_result["last_green_commit"]
             self.__log("FAIL", f"The following tasks are still failing after retry, they are probably broken due to changes from the project itself.")
-            self.__log("FAIL", f"The last green commit is {last_green_commit}. Please file bug for the repository.")
+            self.__log("FAIL", f"The last recorded green commit is {last_green_commit}. Please file bug for the repository.")
             self.__print_job_list(still_failing_tasks)
 
 
@@ -237,13 +242,21 @@ class BuildInfoAnalyzer(threading.Thread):
         retry_per_failed_task = self.__retry_failed_jobs(self.downstream_result, DOWNSTREAM_PIPELINE_CLIENT)
 
         # Report tasks that succeeded after retry
-        succeeded_tasks = [info for _, info in retry_per_failed_task.items() if info["state"] == "passed"]
+        succeeded_tasks = []
+        for task, info in retry_per_failed_task.items():
+            if info["state"] == "passed":
+                succeeded_tasks.append(info)
+                self.downstream_result["tasks"][task]["flaky"] = True
         if succeeded_tasks:
             self.__log("PASSED", "The following tasks succeeded after retry, they might be flaky")
             self.__print_job_list(succeeded_tasks)
 
         # Report tasks that are still failing after retry
-        still_failing_tasks = [info for _, info in retry_per_failed_task.items() if info["state"] != "passed"]
+        still_failing_tasks = []
+        for task, info in retry_per_failed_task.items():
+            if info["state"] != "passed":
+                still_failing_tasks.append(info)
+                self.downstream_result["tasks"][task]["broken"] = True
         if still_failing_tasks:
             self.__log("FAIL", f"The following tasks are still failing after retry, they are probably broken due to recent Bazel changes.")
             self.__print_job_list(still_failing_tasks)
@@ -251,14 +264,16 @@ class BuildInfoAnalyzer(threading.Thread):
         # Do bisect for still failing jobs
         self.__log("PASSED", f"Bisect for still failing tasks...")
         failing_task_names = [name for name, info in retry_per_failed_task.items() if info["state"] != "passed"]
-        # bisect_build = self.__trigger_bisect(failing_task_names)
-        # bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(build_number = bisect_build["number"], logger = self)
-        bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(build_number = 270, logger = self)
+        bisect_build = self.__trigger_bisect(failing_task_names)
+        bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(build_number = bisect_build["number"], logger = self)
+        # bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(build_number = 270, logger = self)
         bisect_result_by_task = {}
         for task in failing_task_names:
             for job in bisect_build["jobs"]:
                 if ("--task_name=" + task) in job["command"]:
-                    bisect_result_by_task[task] = self.__determine_bisect_result(job)
+                    bisect_result_by_task[task], culprit = self.__determine_bisect_result(job)
+                    if culprit:
+                        self.downstream_result["tasks"][task]["culprit"] = culprit
             if task not in bisect_result_by_task:
                 error = f"Bisect job for task {task} is missing in " + bisect_build["web_url"]
                 self.__log("SERIOUS", error)
@@ -270,7 +285,7 @@ class BuildInfoAnalyzer(threading.Thread):
             self.__log("INFO", result)
 
 
-    def analyze(self):
+    def __analyze(self):
         # Main build: PASSED; Downstream build: PASSED
         if self.main_result["state"] == "passed" and self.downstream_result["state"] == "passed":
             self.__log_success("Main build: PASSED; Downstream build: PASSED")
@@ -303,6 +318,7 @@ class BuildInfoAnalyzer(threading.Thread):
 
             if build_info["state"] == "failed":
                 self.__log("SERIOUS", f"Project failed at last green commit. This is probably caused by an infra change, please ping philwo@ or pcloudy@.")
+                self.broken_by_infra = True
             elif build_info["state"] == "passed":
                 self.__log("PASSED", f"Project succeeded at last green commit. Maybe main pipeline and downstream pipeline are broken for different reasons.")
                 self.__analyze_main_pipeline_result()
@@ -312,14 +328,116 @@ class BuildInfoAnalyzer(threading.Thread):
             return
 
 
-    def report(self):
-        pass
-
-
     def run(self):
         self.__get_main_build_result()
-        self.analyze()
-        self.report()
+        self.__analyze()
+
+
+def get_html_link_text(content, link):
+    return f'<a href="{link}" target="_blank">{content}</a>'
+
+
+def add_tasks_info_text(tasks_per_project, info_text):
+    for project, task_list in tasks_per_project.items():
+        html_link_text = ", ".join([get_html_link_text(name, url) for name, url in task_list])
+        info_text.append(f"* **{project}**: {html_link_text}")
+
+
+def collect_tasks_by_key(build_result, project_name, tasks_per_project, key):
+    for task_info in build_result["tasks"].values():
+        if task_info.get(key):
+            if project_name not in tasks_per_project:
+                tasks_per_project[project_name] = []
+            tasks_per_project[project_name].append((task_info["name"], task_info["web_url"]))
+
+
+def report_infra_breakages(analyzers):
+    projects_broken_by_infra = [(analyzer.project, analyzer.pipeline) for analyzer in analyzers if analyzer.broken_by_infra]
+
+    if not projects_broken_by_infra:
+        return
+
+    info_text = [
+        "#### The following tasks are probably broken by infra change",
+        "Check the analyze log for more details.",
+    ]
+    html_link_text = ", ".join([get_html_link_text(project, f"https://buildkite.com/bazel/{pipeline}") for project, pipeline in projects_broken_by_infra])
+    info_text.append(f"* **{project}**: {html_link_text}")
+    print_info("broken_tasks_by_infra", "warning", info_text)
+
+
+def get_bazel_commit_url(commit):
+    return f"https://github.com/bazelbuild/bazel/commit/{commit}"
+
+
+def report_downstream_breakages(analyzers):
+    broken_downstream_tasks_per_project = {}
+    culprits_per_project = {}
+    for analyzer in analyzers:
+        collect_tasks_by_key(analyzer.downstream_result, analyzer.project, broken_downstream_tasks_per_project, "broken")
+        culprits = set()
+        for task_info in analyzer.downstream_result["tasks"].values():
+            if task_info.get("culprit"):
+                culprits.add(task_info["culprit"])
+        culprits_per_project[analyzer.project] = culprits
+
+    if not broken_downstream_tasks_per_project:
+        return
+
+    info_text = ["#### Broken Downstream Tasks"]
+    for project, task_list in broken_downstream_tasks_per_project.items():
+        html_link_text = ", ".join([get_html_link_text(name, url) for name, url in task_list])
+        info_text.append(f"* **{project}**: {html_link_text}")
+        if project in culprits_per_project:
+            culprit_text = ", ".join([get_html_link_text(commit, get_bazel_commit_url(commit)) for commit in culprits_per_project[project]])
+            info_text.append(f"  - Culprit Found: {culprit_text}")
+        else:
+            info_text.append("  - Culprit Not Found: Please check the analyze log for more details")
+    print_info("broken_downstream_tasks", "error", info_text)
+
+
+def report_main_breakages(analyzers):
+    broken_main_tasks_per_project = {}
+    for analyzer in analyzers:
+        collect_tasks_by_key(analyzer.main_result, analyzer.project, broken_main_tasks_per_project, "broken")
+
+    if not broken_main_tasks_per_project:
+        return
+
+    info_text = ["#### Broken Main Tasks"]
+    add_tasks_info_text(broken_main_tasks_per_project, info_text)
+    print_info("broken_main_tasks", "error", info_text)
+
+
+def report_flaky_tasks(analyzers):
+    flaky_main_tasks_per_project = {}
+    flaky_downstream_tasks_per_project = {}
+    for analyzer in analyzers:
+        collect_tasks_by_key(analyzer.main_result, analyzer.project, flaky_main_tasks_per_project, "flaky")
+        collect_tasks_by_key(analyzer.downstream_result, analyzer.project, flaky_downstream_tasks_per_project, "flaky")
+
+    if not flaky_main_tasks_per_project and not flaky_downstream_tasks_per_project:
+        return
+
+    info_text = ["#### Flaky Tasks"]
+
+    if flaky_main_tasks_per_project:
+        info_text.append("##### Main Build")
+        add_tasks_info_text(flaky_tasks_per_project, info_text)
+
+    if flaky_downstream_tasks_per_project:
+        info_text.append("##### Downstream Build")
+        add_tasks_info_text(flaky_downstream_tasks_per_project, info_text)
+
+    print_info("flaky_tasks", "warning", info_text)
+
+
+def report(analyzers):
+    print_info("analyze_log", "info", ["#### Analyze log"])
+    report_flaky_tasks(analyzers)
+    report_main_breakages(analyzers)
+    report_downstream_breakages(analyzers)
+    report_infra_breakages(analyzers)
 
 
 # Get the raw downstream build result from the lastest build
@@ -462,6 +580,9 @@ def main(argv=None):
 
     for analyzer in analyzers:
         analyzer.join()
+
+    report(analyzers)
+
     return 0
 
 if __name__ == "__main__":
