@@ -56,7 +56,7 @@ def print_info(context, style, info):
             f"--style={style}",
             f"\n{info_str}\n",
         ],
-        print_output = False,
+        # print_output = False,
     )
 
 class BuildInfoAnalyzer(threading.Thread):
@@ -179,6 +179,7 @@ class BuildInfoAnalyzer(threading.Thread):
 
 
     def __retry_failed_jobs(self, build_result, buildkite_client):
+        return build_result["tasks"]
         retry_per_failed_task = {}
         for task, info in build_result["tasks"].items():
             if info["state"] != "passed":
@@ -198,7 +199,7 @@ class BuildInfoAnalyzer(threading.Thread):
 
     def __analyze_main_pipeline_result(self):
         self.__log("INFO", "")
-        self.__log("PASSED", "Start analyzing failures in main pipeline...")
+        self.__log("PASSED", "***Analyze failures in main pipeline***")
 
         # Report failed tasks
         self.__log("WARNING", "The following tasks are failing in main pipeline")
@@ -207,7 +208,6 @@ class BuildInfoAnalyzer(threading.Thread):
         # Retry all failed tasks
         self.__log("PASSED", "Retry failed main pipeline tasks...")
         retry_per_failed_task = self.__retry_failed_jobs(self.main_result, self.client)
-        self.__log("PASSED", "")
 
         # Report tasks that succeeded after retry
         succeeded_tasks = [info for _, info in retry_per_failed_task.items() if info["state"] == "passed"]
@@ -226,7 +226,7 @@ class BuildInfoAnalyzer(threading.Thread):
 
     def __analyze_for_downstream_pipeline_result(self):
         self.__log("INFO", "")
-        self.__log("PASSED", "Start analyzing failures in downstream pipeline...")
+        self.__log("PASSED", "***Analyze failures in downstream pipeline***")
 
         # Report failed tasks
         self.__log("WARNING", "The following tasks are failing in downstream pipeline")
@@ -235,7 +235,6 @@ class BuildInfoAnalyzer(threading.Thread):
         # Retry all failed tasks
         self.__log("PASSED", "Retry failed downstream pipeline tasks...")
         retry_per_failed_task = self.__retry_failed_jobs(self.downstream_result, DOWNSTREAM_PIPELINE_CLIENT)
-        self.__log("PASSED", "")
 
         # Report tasks that succeeded after retry
         succeeded_tasks = [info for _, info in retry_per_failed_task.items() if info["state"] == "passed"]
@@ -252,9 +251,9 @@ class BuildInfoAnalyzer(threading.Thread):
         # Do bisect for still failing jobs
         self.__log("PASSED", f"Bisect for still failing tasks...")
         failing_task_names = [name for name, info in retry_per_failed_task.items() if info["state"] != "passed"]
-        bisect_build = self.__trigger_bisect(failing_task_names)
-        bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(build_number = bisect_build["number"], logger = self)
-        # bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(build_number = 270, logger = self)
+        # bisect_build = self.__trigger_bisect(failing_task_names)
+        # bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(build_number = bisect_build["number"], logger = self)
+        bisect_build = CULPRIT_FINDER_PIPELINE_CLIENT.wait_build_to_finish(build_number = 270, logger = self)
         bisect_result_by_task = {}
         for task in failing_task_names:
             for job in bisect_build["jobs"]:
@@ -274,24 +273,27 @@ class BuildInfoAnalyzer(threading.Thread):
     def analyze(self):
         # Main build: PASSED; Downstream build: PASSED
         if self.main_result["state"] == "passed" and self.downstream_result["state"] == "passed":
-            self.__log_success("Project passed in both main build and downstream build.")
+            self.__log_success("Main build: PASSED; Downstream build: PASSED")
             return
 
         # Main build: FAILED; Downstream build: PASSED
         if self.main_result["state"] == "failed" and self.downstream_result["state"] == "passed":
-            self.__log("WARNING", "Project passed in downstream build, but failed in main build.")
+            self.__log("FAIL", "Main build: FAILED")
+            self.__log("PASSED", "Downstream build: PASSED")
             self.__analyze_main_pipeline_result()
             return
 
         # Main build: PASSED; Downstream build: FAILED
         if self.main_result["state"] == "passed" and self.downstream_result["state"] == "failed":
-            self.__log("FAIL", "Project passed in main build, but failed in downstream build.")
+            self.__log("PASSED", "Main build: PASSED")
+            self.__log("FAIL", "Downstream build: FAILED")
             self.__analyze_for_downstream_pipeline_result()
             return
 
         # Main build: FAILED; Downstream build: FAILED
         if self.main_result["state"] == "failed" and self.downstream_result["state"] == "failed":
-            self.__log("SERIOUS", f"Project failed in both main build and downstream build.")
+            self.__log("FAIL", "Main build: FAILED")
+            self.__log("FAIL", "Downstream build: FAILED")
 
             # Rebuild the project at last green commit, check if the failure is caused by infra change.
             last_green_commit = self.main_result["last_green_commit"]
