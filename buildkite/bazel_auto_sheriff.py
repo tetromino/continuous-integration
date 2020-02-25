@@ -292,6 +292,7 @@ class BuildInfoAnalyzer(threading.Thread):
             self.__log("FAIL", "Main build: FAILED")
             self.__log("PASSED", "Downstream build: PASSED")
             self.__analyze_main_pipeline_result()
+            self.__log("HEADER", "Analyzing finished.")
             return
 
         # Main build: PASSED; Downstream build: FAILED
@@ -299,6 +300,7 @@ class BuildInfoAnalyzer(threading.Thread):
             self.__log("PASSED", "Main build: PASSED")
             self.__log("FAIL", "Downstream build: FAILED")
             self.__analyze_for_downstream_pipeline_result()
+            self.__log("HEADER", "Analyzing finished.")
             return
 
         # Main build: FAILED; Downstream build: FAILED
@@ -310,24 +312,26 @@ class BuildInfoAnalyzer(threading.Thread):
 
             # If the lastest build is the last green commit, that means some infra change has caused the breakage.
             if last_green_commit == self.main_result["commit"]:
-                self.__log("SERIOUS", f"Project failed at last green commit. This is probably caused by an infra change, please ping philwo@ or pcloudy@.")
                 self.broken_by_infra = True
+                self.__log("SERIOUS", f"Project failed at last green commit. This is probably caused by an infra change, please ping philwo@ or pcloudy@.")
+                self.__log("HEADER", "Analyzing finished.")
                 return
 
             # Rebuild the project at last green commit, check if the failure is caused by infra change.
             self.__log("PASSED", f"Rebuild at last green commit {last_green_commit}...")
-            build_info = self.client.trigger_new_build(last_green_commit)
+            build_info = self.client.trigger_new_build(last_green_commit, "Trigger build at last green commit.")
             build_info = self.client.wait_build_to_finish(build_number = build_info["number"], logger = self)
 
             if build_info["state"] == "failed":
-                self.__log("SERIOUS", f"Project failed at last green commit. This is probably caused by an infra change, please ping philwo@ or pcloudy@.")
                 self.broken_by_infra = True
+                self.__log("SERIOUS", f"Project failed at last green commit. This is probably caused by an infra change, please ping philwo@ or pcloudy@.")
             elif build_info["state"] == "passed":
                 self.__log("PASSED", f"Project succeeded at last green commit. Maybe main pipeline and downstream pipeline are broken for different reasons.")
                 self.__analyze_main_pipeline_result()
                 self.__analyze_for_downstream_pipeline_result()
             else:
                 self.__log("SERIOUS", f"Rebuilding project at last green commit failed with unknown reason. Please check " + build_info["web_url"])
+            self.__log("HEADER", "Analyzing finished.")
             return
 
 
@@ -366,7 +370,7 @@ def report_infra_breakages(analyzers):
     ]
     html_link_text = ", ".join([get_html_link_text(project, f"https://buildkite.com/bazel/{pipeline}") for project, pipeline in projects_broken_by_infra])
     info_text.append(f"* {html_link_text}")
-    print_info("broken_tasks_by_infra", "warning", info_text)
+    print_info("broken_tasks_by_infra", "error", info_text)
 
 
 def get_bazel_commit_url(commit):
@@ -415,7 +419,7 @@ def report_main_breakages(analyzers):
         "These projects are probably broken by their own changes.",
     ]
     add_tasks_info_text(broken_main_tasks_per_project, info_text)
-    print_info("broken_main_tasks", "error", info_text)
+    print_info("broken_main_tasks", "warning", info_text)
 
 
 def report_flaky_tasks(analyzers):
