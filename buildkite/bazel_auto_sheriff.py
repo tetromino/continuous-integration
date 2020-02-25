@@ -310,9 +310,16 @@ class BuildInfoAnalyzer(threading.Thread):
             self.__log("FAIL", "Main build: FAILED")
             self.__log("FAIL", "Downstream build: FAILED")
 
-            # Rebuild the project at last green commit, check if the failure is caused by infra change.
             last_green_commit = self.main_result["last_green_commit"]
-            self.__log("INFO", f"Rebuild at last green commit {last_green_commit}...")
+
+            # If the lastest build is the last green commit, that means some infra change has caused the breakage.
+            if last_green_commit == self.main_result["commit"]:
+                self.__log("SERIOUS", f"Project failed at last green commit. This is probably caused by an infra change, please ping philwo@ or pcloudy@.")
+                self.broken_by_infra = True
+                return
+
+            # Rebuild the project at last green commit, check if the failure is caused by infra change.
+            self.__log("PASSED", f"Rebuild at last green commit {last_green_commit}...")
             build_info = self.client.trigger_new_build(last_green_commit)
             build_info = self.client.wait_build_to_finish(build_number = build_info["number"], logger = self)
 
@@ -358,11 +365,11 @@ def report_infra_breakages(analyzers):
         return
 
     info_text = [
-        "#### The following tasks are probably broken by infra change",
+        "#### The following projects are probably broken by infra change",
         "Check the analyze log for more details.",
     ]
     html_link_text = ", ".join([get_html_link_text(project, f"https://buildkite.com/bazel/{pipeline}") for project, pipeline in projects_broken_by_infra])
-    info_text.append(f"* **{project}**: {html_link_text}")
+    info_text.append(f"* {html_link_text}")
     print_info("broken_tasks_by_infra", "warning", info_text)
 
 
@@ -384,7 +391,10 @@ def report_downstream_breakages(analyzers):
     if not broken_downstream_tasks_per_project:
         return
 
-    info_text = ["#### Broken Downstream Tasks"]
+    info_text = [
+        "#### Broken projects with Bazel at HEAD (Downstream Build)",
+        "These projects are probably broken by recent Bazel changes.",
+    ]
     for project, task_list in broken_downstream_tasks_per_project.items():
         html_link_text = ", ".join([get_html_link_text(name, url) for name, url in task_list])
         info_text.append(f"* **{project}**: {html_link_text}")
@@ -404,7 +414,10 @@ def report_main_breakages(analyzers):
     if not broken_main_tasks_per_project:
         return
 
-    info_text = ["#### Broken Main Tasks"]
+    info_text = [
+        "#### Broken projects with Bazel at latest release (Main Build)",
+        "These projects are probably broken by their own changes.",
+    ]
     add_tasks_info_text(broken_main_tasks_per_project, info_text)
     print_info("broken_main_tasks", "error", info_text)
 
@@ -419,7 +432,7 @@ def report_flaky_tasks(analyzers):
     if not flaky_main_tasks_per_project and not flaky_downstream_tasks_per_project:
         return
 
-    info_text = ["#### Flaky Tasks"]
+    info_text = ["#### Flaky Projects"]
 
     if flaky_main_tasks_per_project:
         info_text.append("##### Main Build")
