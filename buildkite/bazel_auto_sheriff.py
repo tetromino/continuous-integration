@@ -15,8 +15,6 @@
 # limitations under the License.
 
 import sys
-import datetime
-import json
 import threading
 
 import bazelci
@@ -24,8 +22,6 @@ import bazelci
 BUILDKITE_ORG = "bazel"
 DOWNSTREAM_PIPELINE = "bazel-at-head-plus-downstream"
 CULPRIT_FINDER_PIPELINE = "culprit-finder"
-
-CACHE = False
 
 COLORS = {
     "SERIOUS" : '\033[95m',
@@ -76,15 +72,15 @@ class BuildInfoAnalyzer(threading.Thread):
 
 
     def __get_main_build_result(self):
-        a_day_ago = datetime.datetime.utcnow() - datetime.timedelta(days = 1)
         build_info_list = self.client.get_build_info_list([
             ("branch", "master"),
-            ("created_from", a_day_ago.isoformat()),
+            ("page", "1"),
+            ("per_page", "1"),
             ("state[]", "failed"),
             ("state[]", "passed"),
         ])
         if len(build_info_list) == 0:
-            error = "Cannot find finished build in the past day for pipeline %s, please try to rerun the pipeline first." % self.pipeline
+            error = "Cannot find finished build for pipeline %s, please try to rerun the pipeline first." % self.pipeline
             self.__log("SERIOUS", error)
             raise bazelci.BuildkiteException(error)
         main_build_info = build_info_list[0]
@@ -453,18 +449,18 @@ def report(analyzers):
     report_infra_breakages(analyzers)
 
 
-# Get the raw downstream build result from the lastest build
+# Get the raw downstream build result from the lastest finished build
 def get_latest_downstream_build_info():
-    a_day_ago = datetime.datetime.utcnow() - datetime.timedelta(days = 1)
     downstream_build_list = DOWNSTREAM_PIPELINE_CLIENT.get_build_info_list([
         ("branch", "master"),
-        ("created_from", a_day_ago.isoformat()),
+        ("page", "1"),
+        ("per_page", "1"),
         ("state[]", "failed"),
         ("state[]", "passed"),
     ])
 
     if len(downstream_build_list) == 0:
-        raise bazelci.BuildkiteException("Cannot find finished downstream build in the past day, please try to rerun downstream pipeline first.")
+        raise bazelci.BuildkiteException("Cannot find finished downstream build, please try to rerun downstream pipeline first.")
     return downstream_build_list[0]
 
 
